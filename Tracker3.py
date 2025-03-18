@@ -8,7 +8,7 @@ from ultralytics.solutions.solutions import BaseSolution
 from ultralytics.utils.plotting import Annotator, colors
 
 class ObjectCounter(BaseSolution):
-    def __init__(self, **kwargs):
+    def __init__(self,nombre_archivo, **kwargs):
         super().__init__(**kwargs)
         self.in_count = 0
         self.out_count = 0
@@ -16,6 +16,7 @@ class ObjectCounter(BaseSolution):
         self.saved_ids = []
         self.classwise_counts = {}
         self.region_initialized = False
+        self.nombre_archivo = nombre_archivo
         self.spd = {}
         self.trkd_ids = []
         self.trk_pt = {}
@@ -29,9 +30,10 @@ class ObjectCounter(BaseSolution):
 
     def get_daily_filename(self):
         """Generate a filename based on the current date."""
-        current_date = datetime.now().strftime("%Y-%m-%d")
-        filename = f"vehicle_count_data_{current_date}.csv"
+        #current_date = datetime.now().strftime("%Y-%m-%d")
+        filename = f"{self.nombre_archivo}_vehicle_count_data_.csv"
         return filename
+        
 
     def create_csv(self):
         """Create the CSV file with proper headers if it doesn't exist."""
