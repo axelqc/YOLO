@@ -10,7 +10,7 @@ from ultralytics.yolo.utils import DEFAULT_CONFIG, ROOT, ops
 from ultralytics.yolo.utils.checks import check_imgsz
 from ultralytics.yolo.utils.plotting import Annotator, colors, save_one_box
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Lista de clases de vehículos a detectar (basada en COCO dataset)
 # Índices: 2-car, 3-motorcycle, 5-bus, 7-truck
@@ -19,6 +19,9 @@ VEHICLE_CLASSES = [2, 3, 5, 7]
 # Variables globales
 tracker = None
 vehicle_data = []  # Almacenará datos para exportar a Excel
+base_datetime = None  # Fecha base extraída del nombre del archivo
+fps = 30.0  # Frames por segundo (valor predeterminado)
+frame_count = 0  # Contador global de frames
 
 def init_tracker():
     global tracker
@@ -67,7 +70,62 @@ def random_color_list():
         rand_color = (r, g, b)
         rand_color_list.append(rand_color)
 
-def export_to_excel(output_path):
+def extract_base_datetime(filename):
+    """Extrae la fecha y hora base del nombre del archivo de video"""
+    global base_datetime
+    
+    try:
+        parts = filename.split('_')
+        
+        # Formato: 20210121_20210121081120_20210121081207_081119
+        # Usar el tercer segmento (índice 2) que contiene el tiempo final del video
+        if len(parts) >= 3 and len(parts[2]) >= 14:
+            date_str = parts[2]
+            # Formato: YYYYMMDDHHMMSS (20210121081207)
+            year = int(date_str[0:4])
+            month = int(date_str[4:6])
+            day = int(date_str[6:8])
+            hour = int(date_str[8:10])
+            minute = int(date_str[10:12])
+            second = int(date_str[12:14])
+            
+            base_datetime = datetime(year, month, day, hour, minute, second)
+            print(f"Fecha base extraída: {base_datetime}")
+            return True
+    except Exception as e:
+        print(f"Error al extraer fecha base: {e}")
+    
+    return False
+
+def calculate_timestamp(frame_number):
+    """Calcula el timestamp basado en el número de frame y el FPS"""
+    global base_datetime, fps
+    
+    if base_datetime is None:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+    # Como el timestamp base es el tiempo final del video,
+    # calculamos el tiempo según la posición relativa del frame
+    # asumiendo que frame_count es el total de frames procesados hasta ahora
+    
+    # Si solo procesamos frames impares, ajustamos el cálculo
+    actual_frames_total = frame_count * 2  # estimación del total incluyendo pares e impares
+    
+    # Calcular el tiempo para este frame específico
+    frame_position_ratio = frame_number / actual_frames_total
+    
+    # En lugar de sumar, restamos tiempo desde el tiempo final
+    # para ir "hacia atrás" desde el timestamp final
+    seconds_total = actual_frames_total / fps
+    seconds_from_end = seconds_total * (1 - frame_position_ratio)
+    
+    # El timestamp para este frame es el timestamp base menos el tiempo desde el final
+    current_datetime = base_datetime - timedelta(seconds=seconds_from_end)
+    
+    formatted_timestamp = current_datetime.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]  # Incluir milisegundos
+    return formatted_timestamp
+
+def export_to_excel(output_path, video_name=""):
     """Exporta los datos de vehículos a un archivo Excel"""
     global vehicle_data
     
@@ -77,25 +135,49 @@ def export_to_excel(output_path):
     
     # Crear DataFrame con los datos recolectados
     df = pd.DataFrame(vehicle_data, columns=[
-        'ID', 'Tipo de Vehículo', 'Confianza', 'Trayectoria', 'Tiempo'
+        'ID', 'Tipo de Vehículo', 'Trayectoria', 'Tiempo'
     ])
     
-    # Agrupar por tipo de vehículo para obtener conteos
-    vehicle_counts = df['Tipo de Vehículo'].value_counts().reset_index()
-    vehicle_counts.columns = ['Tipo de Vehículo', 'Conteo']
+    # Obtener el nombre del archivo de video para nombrar el Excel
+    file_prefix = ""
+    if video_name:
+        # Extraer la primera parte del nombre (antes del primer guion bajo)
+        parts = os.path.basename(video_name).split('_')
+        if parts:
+            file_prefix = parts[0] + "_"
     
     # Crear un archivo Excel con múltiples hojas
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    excel_path = os.path.join(output_path, f'deteccion_vehiculos_{timestamp}.xlsx')
+    excel_path = os.path.join(output_path, f'{file_prefix}deteccion_vehiculos_{timestamp}.xlsx')
     
     with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
         df.to_excel(writer, sheet_name='Datos_Detallados', index=False)
-        vehicle_counts.to_excel(writer, sheet_name='Conteo_Vehiculos', index=False)
     
     print(f"Datos exportados a: {excel_path}")
 
 
 class DetectionPredictor(BasePredictor):
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        # Contador de frames para procesar solo los impares
+        self.frame_count = 0
+        
+        # Obtener FPS del video de entrada
+        try:
+            source_path = str(self.args.source)
+            if os.path.isfile(source_path) and source_path.lower().endswith(('.mp4', '.avi', '.mov')):
+                cap = cv2.VideoCapture(source_path)
+                if cap.isOpened():
+                    global fps
+                    fps_value = cap.get(cv2.CAP_PROP_FPS)
+                    if fps_value > 0:
+                        fps = fps_value
+                cap.release()
+                
+                # Extraer timestamp base del nombre del archivo
+                extract_base_datetime(os.path.basename(source_path))
+        except Exception:
+            pass
     
     def get_annotator(self, img):
         return Annotator(img, line_width=self.args.line_thickness, example=str(self.model.names))
@@ -120,7 +202,7 @@ class DetectionPredictor(BasePredictor):
         return preds
 
     def write_results(self, idx, preds, batch):
-        global vehicle_data
+        global vehicle_data, frame_count
         
         p, im, im0 = batch
         log_string = ""
@@ -133,6 +215,15 @@ class DetectionPredictor(BasePredictor):
             frame = self.dataset.count
         else:
             frame = getattr(self.dataset, 'frame', 0)
+            
+        # Incrementar el contador de frames
+        self.frame_count += 1
+        frame_count = self.frame_count  # Actualizar contador global
+        
+        # Procesar solo frames impares para mayor velocidad
+        # Para frames pares, simplemente retornar sin procesar
+        if self.frame_count % 2 == 0:
+            return log_string
         
         # Tracker
         self.data_path = p
@@ -173,15 +264,14 @@ class DetectionPredictor(BasePredictor):
         tracked_dets = tracker.update(dets_to_sort)
         tracks = tracker.getTrackers()
         
-        # Timestamp para esta detección
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Calcular timestamp basado en el número de frame
+        timestamp = calculate_timestamp(self.frame_count)
         
         # Dibujar las trayectorias
         for track in tracks:
             # Guardar datos para Excel
             if hasattr(track, 'detclass') and len(track.centroidarr) > 1:
                 vehicle_type = self.model.names[int(track.detclass)]
-                confidence = track.confidence if hasattr(track, 'confidence') else 0.0
                 
                 # Crear string de la trayectoria
                 trajectory = []
@@ -193,7 +283,6 @@ class DetectionPredictor(BasePredictor):
                 vehicle_data.append([
                     track.id,
                     vehicle_type,
-                    float(confidence),
                     trajectory_str,
                     timestamp
                 ])
@@ -205,7 +294,7 @@ class DetectionPredictor(BasePredictor):
                         int(track.centroidarr[i+1][1])),
                         rand_color_list[track.id], thickness=3) 
                         for i, _ in enumerate(track.centroidarr) 
-                            if i < len(track.centroidarr)-1 ]
+                            if i < len(track.centroidarr)-1]
         
         # Dibujar cajas delimitadoras si hay detecciones
         if len(tracked_dets) > 0:
@@ -238,12 +327,22 @@ def predict(cfg):
     output_dir = os.path.join(ROOT, "resultados")
     os.makedirs(output_dir, exist_ok=True)
     
+    # Obtener el nombre del video para nombrar el archivo Excel
+    video_name = ""
+    try:
+        # Convertir cfg.source a string para manejar diferentes tipos de entrada
+        source_path = str(cfg.source)
+        if os.path.isfile(source_path):
+            video_name = os.path.basename(source_path)
+    except Exception:
+        pass
+    
     # Ejecutar la detección
     predictor = DetectionPredictor(cfg)
     predictor()
     
     # Exportar a Excel
-    export_to_excel(output_dir)
+    export_to_excel(output_dir, video_name)
 
 
 if __name__ == "__main__":
